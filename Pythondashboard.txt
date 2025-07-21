@@ -1,0 +1,81 @@
+import pandas as pd
+import dash
+from dash import html, dcc, dash_table
+import plotly.express as px
+
+# Load Excel data
+excel_path = r"E:\Dashboard\ComputerSummary_1507025_210226.xlsx"
+df = pd.read_excel(excel_path)
+
+# Get reboot count
+status_counts = df['Reboot Required'].value_counts().reset_index()
+status_counts.columns = ['Reboot Required', 'Count']
+
+# Unique values for filtering
+group_names = df['Computer Group Name'].unique()
+
+# Create Dash app
+app = dash.Dash(__name__)
+app.title = "WSUS Dashboard"
+
+app.layout = html.Div([
+    html.H1("WSUS Reboot Dashboard"),
+
+    # Dropdown filter
+    html.Label("Filter by Group:"),
+    dcc.Dropdown(
+        id='group-filter',
+        options=[{"label": grp, "value": grp} for grp in group_names],
+        value=None,
+        placeholder="Select a group",
+        clearable=True
+    ),
+
+    # Pie chart
+    dcc.Graph(id='pie-chart'),
+
+    # Bar chart
+    dcc.Graph(id='bar-chart'),
+
+    # Data table
+    html.H3("WSUS Excel Report"),
+    dash_table.DataTable(
+        id='table',
+        columns=[{"name": i, "id": i} for i in df.columns],
+        data=df.to_dict('records'),
+        page_size=100,
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'left'}
+    )
+])
+
+# Callbacks for filtering and charts
+@app.callback(
+    [dash.dependencies.Output('pie-chart', 'figure'),
+     dash.dependencies.Output('bar-chart', 'figure'),
+     dash.dependencies.Output('table', 'data')],
+    [dash.dependencies.Input('group-filter', 'value')]
+)
+def update_dashboard(selected_group):
+    if selected_group:
+        filtered_df = df[df['Computer Group Name'] == selected_group]
+    else:
+        filtered_df = df
+
+    pie_fig = px.pie(
+        filtered_df['Reboot Required'].value_counts().reset_index(),
+        names='index', values='Reboot Required',
+        title='Reboot Status'
+    )
+
+    bar_fig = px.bar(
+        filtered_df['Reboot Required'].value_counts().reset_index(),
+        x='index', y='Reboot Required',
+        title='Reboot Status Count'
+    )
+
+    return pie_fig, bar_fig, filtered_df.to_dict('records')
+
+# Run the app
+if __name__ == '__main__':
+    app.run(debug=True, host="0.0.0.0", port=8050)
