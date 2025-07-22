@@ -1,0 +1,35 @@
+# Monitor-Processes.ps1
+# Logs current time, top CPU and memory-consuming processes, and basic disk info every 30 seconds.
+
+$LogFile = "C:\Temp\Process_Monitor_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+# Create directory if it doesn't exist
+if (-not (Test-Path "C:\Temp")) {
+    New-Item -Path "C:\Temp" -ItemType Directory
+}
+
+Write-Host "Logging process and system info every 30 seconds. Press Ctrl+C to stop."
+Write-Host "Log file: $LogFile"
+Add-Content -Path $LogFile -Value "==== Process Monitoring Started at $(Get-Date) ===="
+
+while ($true) {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $LogFile -Value "`n----- Snapshot: $timestamp -----"
+
+    # Get top 10 CPU-consuming processes
+    $cpuProcs = Get-Process | Sort-Object CPU -Descending | Select-Object -First 10 | Format-Table -AutoSize | Out-String
+    Add-Content -Path $LogFile -Value "`nTop 10 CPU-Consuming Processes:`n$cpuProcs"
+
+    # Get top 10 Memory-consuming processes
+    $memProcs = Get-Process | Sort-Object WorkingSet -Descending | Select-Object -First 10 | Format-Table -AutoSize | Out-String
+    Add-Content -Path $LogFile -Value "`nTop 10 Memory-Consuming Processes:`n$memProcs"
+
+    # Basic disk queue info (if needed later)
+    $diskStats = Get-WmiObject Win32_PerfFormattedData_PerfDisk_LogicalDisk |
+        Select-Object Name, AvgDiskSecPerRead, AvgDiskSecPerWrite, DiskReadsPerSec, DiskWritesPerSec |
+        Format-Table -AutoSize | Out-String
+    Add-Content -Path $LogFile -Value "`nDisk Stats:`n$diskStats"
+
+    # Wait 30 seconds before next snapshot
+    Start-Sleep -Seconds 30
+}
