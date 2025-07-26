@@ -1,0 +1,48 @@
+# Initialize results array
+$results = @()
+
+# Create timestamp
+$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+foreach ($ip in $ipList) {
+    $cmd = "C:\PSTools\psshutdown.exe \\$ip -u itadmin -p 'W!pr0ge@123' -r -c -e P:4:1 -t 40 -m 'Critical security update: Your server is being rebooted as part of monthly patching' -accepteula"
+    
+    try {
+        # Capture command output
+        $output = Invoke-Expression $cmd 2>&1 | Out-String
+        
+        # Check for success indicators
+        if ($output -match "shutdown scheduled") {
+            $status = "Success"
+            $errorMsg = $null
+        } else {
+            throw "Unexpected response"
+        }
+    }
+    catch {
+        $status = "Failed"
+        $errorMsg = $_.Exception.Message
+        
+        # Extract specific error details
+        if ($output -match "Couldn't access") {
+            $errorMsg = "Access denied: Invalid credentials or permissions"
+        }
+        elseif ($output -match "already performing a shutdown") {
+            $errorMsg = "Shutdown already in progress"
+        }
+    }
+    
+    # Add detailed result
+    $results += [PSCustomObject]@{
+        IP          = $ip
+        Credential  = "itadmin"
+        Status      = $status
+        Timestamp   = $timestamp
+        Error       = $errorMsg
+        Command     = $cmd
+        RawOutput   = $output
+    }
+}
+
+# Export results
+$results | Export-Excel -Path ".\reboot_status_$($timestamp.Replace(':','-')).xlsx" -WorksheetName VMList -AutoSize
