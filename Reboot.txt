@@ -1,0 +1,92 @@
+pipeline {
+    agent any
+
+    parameters {
+        base64File(
+            name: 'BASE64_SERVERS_FILE',
+            description: 'Upload a base64-encoded server list text file (e.g., servers.txt)'
+        )
+    }
+
+    stages {
+        stage('Decode Base64 File') {
+            steps {
+                script {
+                    // Save base64 content to a file
+                    writeFile file: 'encoded.txt', text: params.BASE64_SERVERS_FILE
+
+                    // Decode and save as servers.txt
+                    powershell '''
+                        $b64 = Get-Content "encoded.txt"
+                        $bytes = [System.Convert]::FromBase64String($b64)
+                        [System.IO.File]::WriteAllBytes("servers.txt", $bytes)
+                    '''
+                }
+            }
+        }
+
+        stage('Run PsShutdown Script') {
+            steps {
+                powershell '''
+                    if (-not (Get-Command Export-Excel -ErrorAction SilentlyContinue)) {
+                        Install-Module -Name ImportExcel -Force -Scope CurrentUser
+                    }
+
+                    $servers = Get-Content "servers.txt"
+                    $credentials = @(
+                        @{User="Administrator"; Pass="Password@123"},
+                        @{User="itadmin"; Pass="W!pr0ge@123"},
+                        @{User="localuser"; Pass="Test@123"}
+                    )
+
+                    $results = @()
+
+                    foreach ($server in $servers) {
+                        $success = $false
+                        foreach ($cred in $credentials) {
+                            $user = $cred.User
+                            $pass = $cred.Pass
+                            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+                            $netUseCmd = cmd /c "net use \\\\$server\\admin$ /user:$user $pass"
+                            if ($LASTEXITCODE -eq 0) {
+                                try {
+                                    & "C:\\PSTools\\PsShutdown.exe" \\\\$server -u $user -p $pass -r -c -e p:4:1 -t 60 -m "Critical Security Update: Your server will reboot." -accepteula
+                                    $status = "Shutdown Success"
+                                } catch {
+                                    $status = "Credential OK, Shutdown Failed"
+                                }
+
+                                $results += [PSCustomObject]@{
+                                    IPAddress  = $server
+                                    Credential = "$user"
+                                    Status     = $status
+                                    Timestamp  = $timestamp
+                                }
+                                $success = $true
+                                break
+                            }
+                        }
+
+                        if (-not $success) {
+                            $results += [PSCustomObject]@{
+                                IPAddress  = $server
+                                Credential = "All Failed"
+                                Status     = "Access Denied"
+                                Timestamp  = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                            }
+                        }
+                    }
+
+                    $results | Export-Excel -Path "ShutdownResults.xlsx" -AutoSize
+                '''
+            }
+        }
+
+        stage('Archive Excel Report') {
+            steps {
+                archiveArtifacts artifacts: 'ShutdownResults.xlsx', onlyIfSuccessful: true
+            }
+        }
+    }
+}
