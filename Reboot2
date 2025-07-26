@@ -1,0 +1,92 @@
+pipeline {
+    agent any
+    parameters {
+        base64File(name: 'SERVER_LIST_FILE', description: 'Upload your server list text file (Base64 encoded)')
+    }
+    environment {
+        SERVER_FILE = 'servers.txt'
+        OUTPUT_EXCEL = 'final_reboot_status.xlsx'
+    }
+    stages {
+        stage('Stage 1: Decode Server List') {
+            steps {
+                script {
+                    // Decode base64 file and save as servers.txt
+                    def decoded = new String(params.SERVER_LIST_FILE.decodeBase64())
+                    writeFile file: "${SERVER_FILE}", text: decoded
+                }
+            }
+        }
+
+        stage('Stage 2: Reboot using itadmin') {
+            steps {
+                powershell '''
+                    powershell -ExecutionPolicy Bypass -File stage2_reboot_itadmin.ps1
+                '''
+            }
+        }
+
+        stage('Stage 3: Retry failed with administrator') {
+            steps {
+                powershell '''
+                    powershell -ExecutionPolicy Bypass -File stage3_retry_admin.ps1
+                '''
+            }
+        }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: "${OUTPUT_EXCEL}", fingerprint: true
+        }
+    }
+}
+
+stage2
+
+$servers = Get-Content ".\\servers.txt"
+$results = @()
+
+foreach ($ip in $servers) {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $cmd = "C:\\PSTools\\psshutdown.exe \\$ip -u itadmin -p itadmin123 -r -c -e P:4:1 -t 60 -m 'Reboot by itadmin' -accepteula"
+    
+    try {
+        Invoke-Expression $cmd | Out-Null
+        $results += [PSCustomObject]@{ IP = $ip; Credential = "itadmin"; Status = "Success"; Timestamp = $timestamp }
+    } catch {
+        $results += [PSCustomObject]@{ IP = $ip; Credential = "itadmin"; Status = "Failed"; Timestamp = $timestamp }
+    }
+}
+
+$results | Export-Csv ".\\reboot_status.csv" -NoTypeInformation
+
+stage3
+
+$retries = Import-Csv ".\\reboot_status.csv" | Where-Object { $_.Status -eq "Failed" }
+$final = @()
+
+foreach ($entry in $retries) {
+    $ip = $entry.IP
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $cmd = "C:\\PSTools\\psshutdown.exe \\$ip -u administrator -p password123 -r -c -e P:4:1 -t 60 -m 'Retry reboot by admin' -accepteula"
+
+    try {
+        Invoke-Expression $cmd | Out-Null
+        $final += [PSCustomObject]@{ IP = $ip; Credential = "administrator"; Status = "Success"; Timestamp = $timestamp }
+    } catch {
+        $final += [PSCustomObject]@{ IP = $ip; Credential = "All creds failed"; Status = "Failed"; Timestamp = $timestamp }
+    }
+}
+
+# Combine and export to Excel
+$all = Import-Csv ".\\reboot_status.csv" + $final
+$all | Export-Csv ".\\final_reboot_status.csv" -NoTypeInformation
+
+# Convert to Excel
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$wb = $excel.Workbooks.Open((Resolve-Path ".\\final_reboot_status.csv"))
+$wb.SaveAs((Resolve-Path ".\\final_reboot_status.xlsx"), 51)
+$wb.Close($false)
+$excel.Quit()
+[System.Runtime.Interopservices.Marshal]::ReleaseComObject($excel) | Out-Null
