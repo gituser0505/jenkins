@@ -1,0 +1,86 @@
+pipeline {
+    agent any
+
+    parameters {
+        base64File 'server_list.txt' // base64 encoded server list
+    }
+
+    environment {
+        CREDS = """[
+            {"user": "admin1", "pass": "Password1"},
+            {"user": "admin2", "pass": "Password2"},
+            {"user": "admin3", "pass": "Password3"}
+        ]"""
+    }
+
+    stages {
+        stage('Prepare Server List') {
+            steps {
+                script {
+                    def decoded = new String(params.server_list.decodeBase64())
+                    writeFile file: 'servers.txt', text: decoded
+                }
+            }
+        }
+
+        stage('Run Reboot Attempts') {
+            steps {
+                powershell '''
+                    Install-Module -Name ImportExcel -Force -Scope CurrentUser
+
+                    $servers = Get-Content servers.txt
+                    $creds = ConvertFrom-Json $env:CREDS
+                    $results = @()
+
+                    foreach ($server in $servers) {
+                        $success = $false
+                        foreach ($cred in $creds) {
+                            $user = $cred.user
+                            $pass = $cred.pass
+
+                            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+                            try {
+                                cmd /c "net use \\\\$server\\admin$ /user:$user $pass" > $null 2>&1
+                                if ($LASTEXITCODE -eq 0) {
+                                    & 'C:\\PSTools\\PsShutdown.exe' \\\\$server -u $user -p $pass -r -c -e p:4:1 -t 60 -m "Monthly patching reboot" -accepteula
+                                    $result = "Success"
+                                    $success = $true
+                                    break
+                                } else {
+                                    $result = "NetUse Failed"
+                                }
+                            } catch {
+                                $result = "Error: $_"
+                            }
+
+                            $results += [PSCustomObject]@{
+                                IP        = $server
+                                Username  = $user
+                                Result    = $result
+                                Timestamp = $timestamp
+                            }
+                        }
+
+                        if (-not $success) {
+                            $results += [PSCustomObject]@{
+                                IP        = $server
+                                Username  = "All Failed"
+                                Result    = "Credential Failed"
+                                Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+                            }
+                        }
+                    }
+
+                    $results | Export-Excel -Path result.xlsx -AutoSize
+                '''
+            }
+        }
+
+        stage('Archive Excel') {
+            steps {
+                archiveArtifacts artifacts: 'result.xlsx', fingerprint: true
+            }
+        }
+    }
+}
