@@ -1,0 +1,375 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'MACHINE_IP', defaultValue: '', description: 'Target machine IP or hostname (required)')
+    string(name: 'USERNAME', defaultValue: '', description: 'Username to authenticate (DOMAIN\\user or user)')
+    password(name: 'PASSWORD', defaultValue: '', description: 'Password for the user')
+    string(name: 'WIN10_ISO_PATH', defaultValue: '\\\\fileserver\\isos\\Win10_22H2_x64.iso', description: 'UNC path reachable by target for Win10 22H2 ISO')
+    string(name: 'WIN11_ISO_PATH', defaultValue: '\\\\fileserver\\isos\\Win11_24H2_x64.iso', description: 'UNC path reachable by target for Win11 24H2 ISO')
+    choice(name: 'WINRM_PROTO', choices: ['http','https'], description: 'WinRM protocol to use (http => 5985, https => 5986)')
+    booleanParam(name: 'FORCE_DYNAMICUPDATE_DISABLE', defaultValue: true, description: 'If true, pass /dynamicupdate disable to setup.exe')
+  }
+
+  environment {
+    WORK = "${env.WORKSPACE}"
+    PYTHON_USER_BASE = "${env.HOME}/.local"
+  }
+
+  stages {
+
+    stage('Prepare agent & install pywinrm if necessary') {
+      steps {
+        echo "Installing pywinrm on agent if missing..."
+        // Use sh; if your agent is Windows switch to a PowerShell-based install
+        sh '''
+        set -e
+        if ! python3 -c "import winrm" >/dev/null 2>&1; then
+          echo "pywinrm not present, installing..."
+          python3 -m pip install --user pywinrm
+        else
+          echo "pywinrm already installed."
+        fi
+        python3 - <<'PY'
+import sys, pkgutil
+if pkgutil.find_loader("winrm") is None:
+    print("pywinrm not found after install attempt.")
+    sys.exit(1)
+print("pywinrm available")
+PY
+        '''
+      }
+    }
+
+    stage('Check WinRM connectivity') {
+      steps {
+        script {
+          def proto = params.WINRM_PROTO == 'https' ? 'https' : 'http'
+          def port = params.WINRM_PROTO == 'https' ? 5986 : 5985
+          writeFile file: 'winrm_check.py', text: """
+import sys, traceback
+import winrm
+host = '${params.MACHINE_IP}'
+user = '${params.USERNAME}'
+pwd = '${params.PASSWORD}'
+transport = 'ntlm'
+# if you use https with self-signed certs you might need to set server_cert_validation='ignore'
+opts = {}
+if '${proto}' == 'https':
+    opts['server_cert_validation'] = 'ignore'
+try:
+    sess = winrm.Session(host, auth=(user, pwd), transport=transport, **opts)
+    r = sess.run_ps('hostname; whoami')
+    print('--- STDOUT ---')
+    print(r.std_out.decode('utf-8', errors='replace'))
+    print('--- STDERR ---')
+    print(r.std_err.decode('utf-8', errors='replace'))
+    print('EXIT CODE:', r.status_code)
+    if r.status_code != 0:
+        print('WINRM_CMD_FAILED')
+        sys.exit(2)
+except Exception as e:
+    print('WINRM_CONN_ERROR', e)
+    traceback.print_exc()
+    sys.exit(3)
+"""
+          sh 'python3 winrm_check.py > winrm_check.out 2>&1 || true'
+          echo readFile('winrm_check.out')
+          // Fail if we saw WINRM_CONN_ERROR or WINRM_CMD_FAILED
+          def checkOut = readFile('winrm_check.out')
+          if (checkOut.contains('WINRM_CONN_ERROR') || checkOut.contains('WINRM_CMD_FAILED')) {
+            error("WinRM connection or remote command failed. See winrm_check.out in workspace.")
+          } else {
+            echo "WinRM connectivity verified."
+          }
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'winrm_check.out', fingerprint: true
+        }
+      }
+    }
+
+    stage('Query OS version (remote)') {
+      steps {
+        script {
+          writeFile file: 'get_os_info.py', text: """
+import sys
+import winrm
+host='${params.MACHINE_IP}'
+user='${params.USERNAME}'
+pwd='${params.PASSWORD}'
+opts={}
+if '${params.WINRM_PROTO}'=='https':
+    opts['server_cert_validation']='ignore'
+sess=winrm.Session(host, auth=(user,pwd), transport='ntlm', **opts)
+ps = r'''
+$os = Get-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion" -ErrorAction Stop;
+[PSCustomObject]@{
+  ProductName = $os.ProductName
+  DisplayVersion = ($os.DisplayVersion -replace '\\r|\\n','') 
+  ReleaseId = $os.ReleaseId
+  CurrentBuild = $os.CurrentBuild
+  UB = $os.UBR
+}
+'''
+r = sess.run_ps(ps)
+sys.stdout.buffer.write(r.std_out)
+sys.stderr.buffer.write(r.std_err)
+sys.exit(r.status_code)
+"""
+          sh 'python3 get_os_info.py > os_info.out 2>&1 || true'
+          echo readFile('os_info.out')
+          archiveArtifacts artifacts: 'os_info.out', fingerprint: true
+          // parse result for decision
+          def osRaw = readFile('os_info.out')
+          // Basic heuristics - check product name + displayversion
+          def isWin10 = osRaw.toLowerCase().contains('windows 10')
+          def isWin11 = osRaw.toLowerCase().contains('windows 11')
+          // Attempt extract DisplayVersion value
+          def displayVersion = ''
+          def m = (osRaw =~ /DisplayVersion\\s*:\\s*(\\S+)/)
+          if (m) { displayVersion = m[0][1] }
+          echo "isWin10=${isWin10}, isWin11=${isWin11}, displayVersion=${displayVersion}"
+          // Save flags to file for later conditional stages
+          writeFile file: 'os_flags.json', text: groovy.json.JsonOutput.toJson([isWin10:isWin10, isWin11:isWin11, displayVersion:displayVersion])
+        }
+      }
+    }
+
+    stage('Decide upgrade path') {
+      steps {
+        script {
+          def f = readFile('os_flags.json')
+          def map = readJSON text: f
+          if (map.isWin10 && map.displayVersion != '22H2') {
+            echo "Target is Windows 10 and not 22H2 -> will run Win10 22H2 upgrade stage."
+            writeFile file: 'next_step.txt', text: 'upgrade_win10'
+          } else if (map.isWin10 && map.displayVersion == '22H2') {
+            echo "Target is Windows 10 and already 22H2 -> suggest upgrading to Win11 if desired."
+            writeFile file: 'next_step.txt', text: 'none_win10'
+          } else if (map.isWin11 && map.displayVersion != '24H2') {
+            echo "Target is Windows 11 and not 24H2 -> will run Win11 24H2 upgrade stage."
+            writeFile file: 'next_step.txt', text: 'upgrade_win11'
+          } else if (map.isWin11 && map.displayVersion == '24H2') {
+            echo "Target already Windows 11 24H2 -> nothing to do."
+            writeFile file: 'next_step.txt', text: 'none_win11'
+          } else {
+            echo "Unable to determine exact OS or it is unsupported. Stopping."
+            writeFile file: 'next_step.txt', text: 'unknown'
+          }
+        }
+      }
+    }
+
+    stage('Upgrade to Windows 10 22H2 (if required)') {
+      when {
+        expression { readFile('next_step.txt').trim() == 'upgrade_win10' }
+      }
+      steps {
+        script {
+          // We'll push a small PS wrapper to the remote to call setup.exe from the UNC path
+          def wrapper = """
+param(
+  [string]\$IsoUNC = '${params.WIN10_ISO_PATH}',
+  [string]\$LogFolder = 'C:\\Windows\\Temp\\JenkinsUpgradeLogs',
+  [switch]\$DisableDynamicUpdate
+)
+
+New-Item -Path \$LogFolder -ItemType Directory -Force | Out-Null
+Write-Output \"Mounting ISO from \$IsoUNC...\"
+
+# Use PowerShell to mount ISO from UNC (requires admin)
+# We will use Mount-DiskImage which expects a local path - so copy the ISO locally first if needed
+# If the UNC is accessible to the target, copy to temp path
+\$localIso = Join-Path \$env:TEMP (Split-Path \$IsoUNC -Leaf)
+Write-Output \"Copying \$IsoUNC to \$localIso...\"
+Copy-Item -Path \$IsoUNC -Destination \$localIso -Force
+
+Write-Output 'Mounting local ISO...'
+Mount-DiskImage -ImagePath \$localIso -ErrorAction Stop
+Start-Sleep -Seconds 3
+\$drive = (Get-DiskImage -ImagePath \$localIso | Get-Volume).DriveLetter + ':'
+Write-Output \"ISO mounted at \$drive\"
+\$setup = Join-Path \$drive 'setup.exe'
+if (-not (Test-Path \$setup)) {
+  Write-Output 'setup.exe not found on mounted ISO' ; exit 1
+}
+
+# Run Compat scan
+\$compatArgs = '/Compat ScanOnly /copylogs \"' + \$LogFolder + '\"'
+Write-Output \"Running compat scan: \$compatArgs\"
+& \$setup \$compatArgs
+\$code = \$LASTEXITCODE
+Write-Output \"Compat scan exit code: \$code\"
+if (\$code -ne 0xC1900210 -and \$code -ne 0) {
+  Write-Output \"Compatibility scan found blockers (exit \$code). Aborting.\"
+  exit 2
+}
+
+# Build upgrade args
+\$upgradeArgs = '/auto upgrade /quiet /noreboot'
+if (\$DisableDynamicUpdate) { \$upgradeArgs += ' /dynamicupdate disable' }
+\$upgradeArgs += ' /copylogs \"' + \$LogFolder + '\"'
+Write-Output \"Launching upgrade: \$upgradeArgs\"
+& \$setup \$upgradeArgs
+\$code2 = \$LASTEXITCODE
+Write-Output \"Setup exit: \$code2\"
+# The actual Finish requires reboot; leave to admin or automation
+exit \$code2
+"""
+          writeFile file: 'win10_upgrade_wrapper.ps1', text: wrapper
+          // Encode wrapper for remote run
+          def wrapperBase64 = wrapper.bytes.encodeBase64().toString()
+          // Python remote runner to create file and execute
+          writeFile file: 'run_remote_win10_upgrade.py', text: """
+import winrm, sys, time
+host='${params.MACHINE_IP}'
+user='${params.USERNAME}'
+pwd='${params.PASSWORD}'
+opts={}
+if '${params.WINRM_PROTO}'=='https':
+    opts['server_cert_validation']='ignore'
+sess = winrm.Session(host, auth=(user,pwd), transport='ntlm', **opts)
+
+ps_create = r\"\"\"
+\$b = [System.Convert]::FromBase64String('${wrapperBase64}')
+[IO.File]::WriteAllBytes('C:\\Windows\\Temp\\jenkins_win10_upgrade.ps1', \$b)
+\"\"\"
+print('Creating wrapper on remote...')
+r = sess.run_ps(ps_create)
+print(r.status_code)
+print(r.std_out.decode('utf-8'))
+print(r.std_err.decode('utf-8'))
+if r.status_code != 0:
+    print('ERROR_WRAPPER_CREATE'); sys.exit(5)
+
+# Execute wrapper
+exec_cmd = r'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\jenkins_win10_upgrade.ps1 -IsoUNC "${params.WIN10_ISO_PATH}"' + (' -DisableDynamicUpdate' if ${params.FORCE_DYNAMICUPDATE_DISABLE} else '')
+print('Running upgrade script...')
+r2 = sess.run_cmd(exec_cmd)
+print('EXIT', r2.status_code)
+print('STDOUT:\\n', r2.std_out.decode('utf-8', errors='replace'))
+print('STDERR:\\n', r2.std_err.decode('utf-8', errors='replace'))
+sys.exit(r2.status_code)
+"""
+          sh 'python3 run_remote_win10_upgrade.py > win10_upgrade.out 2>&1 || true'
+          archiveArtifacts artifacts: 'win10_upgrade.out', fingerprint: true
+          echo readFile('win10_upgrade.out')
+          def out = readFile('win10_upgrade.out')
+          if (out.contains('ERROR_WRAPPER_CREATE')) { error('Failed to create remote wrapper') }
+          if (! (out =~ /EXIT\\s+0/)) {
+            error("Remote upgrade did not return success. Check logs: win10_upgrade.out and remote Panther logs.")
+          } else {
+            echo "Win10 upgrade launched successfully on remote. Check remote logs and schedule reboot."
+          }
+        }
+      }
+    }
+
+    stage('Upgrade to Windows 11 24H2 (if required)') {
+      when {
+        expression { readFile('next_step.txt').trim() == 'upgrade_win11' }
+      }
+      steps {
+        script {
+          // Reuse same pattern as Win10 stage but use WIN11 ISO
+          def wrapper = """
+param(
+  [string]\$IsoUNC = '${params.WIN11_ISO_PATH}',
+  [string]\$LogFolder = 'C:\\Windows\\Temp\\JenkinsUpgradeLogs',
+  [switch]\$DisableDynamicUpdate
+)
+New-Item -Path \$LogFolder -ItemType Directory -Force | Out-Null
+\$localIso = Join-Path \$env:TEMP (Split-Path \$IsoUNC -Leaf)
+Copy-Item -Path \$IsoUNC -Destination \$localIso -Force
+Mount-DiskImage -ImagePath \$localIso -ErrorAction Stop
+Start-Sleep -Seconds 3
+\$drive = (Get-DiskImage -ImagePath \$localIso | Get-Volume).DriveLetter + ':'
+\$setup = Join-Path \$drive 'setup.exe'
+if (-not (Test-Path \$setup)) { Write-Output 'setup.exe not found' ; exit 1 }
+
+\$compatArgs = '/Compat ScanOnly /copylogs \"' + \$LogFolder + '\"'
+& \$setup \$compatArgs
+\$code = \$LASTEXITCODE
+if (\$code -ne 0xC1900210 -and \$code -ne 0) {
+  Write-Output \"Compatibility scan found blockers (exit \$code). Aborting.\"
+  exit 2
+}
+
+\$upgradeArgs = '/auto upgrade /quiet /noreboot'
+if (\$DisableDynamicUpdate) { \$upgradeArgs += ' /dynamicupdate disable' }
+\$upgradeArgs += ' /copylogs \"' + \$LogFolder + '\"'
+& \$setup \$upgradeArgs
+exit \$LASTEXITCODE
+"""
+          writeFile file: 'win11_upgrade_wrapper.ps1', text: wrapper
+          def wrapperBase64 = wrapper.bytes.encodeBase64().toString()
+          writeFile file: 'run_remote_win11_upgrade.py', text: """
+import winrm, sys
+host='${params.MACHINE_IP}'
+user='${params.USERNAME}'
+pwd='${params.PASSWORD}'
+opts={}
+if '${params.WINRM_PROTO}'=='https':
+    opts['server_cert_validation']='ignore'
+sess = winrm.Session(host, auth=(user,pwd), transport='ntlm', **opts)
+ps_create = r\"\"\"
+\$b = [System.Convert]::FromBase64String('${wrapperBase64}')
+[IO.File]::WriteAllBytes('C:\\Windows\\Temp\\jenkins_win11_upgrade.ps1', \$b)
+\"\"\"
+r = sess.run_ps(ps_create)
+print('create rc', r.status_code)
+print(r.std_out.decode('utf-8'))
+print(r.std_err.decode('utf-8'))
+if r.status_code != 0:
+    print('ERROR_WRAPPER_CREATE'); sys.exit(5)
+
+exec_cmd = r'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -ExecutionPolicy Bypass -File C:\\Windows\\Temp\\jenkins_win11_upgrade.ps1 -IsoUNC "${params.WIN11_ISO_PATH}"' + (' -DisableDynamicUpdate' if ${params.FORCE_DYNAMICUPDATE_DISABLE} else '')
+r2 = sess.run_cmd(exec_cmd)
+print('EXIT', r2.status_code)
+print('STDOUT:\\n', r2.std_out.decode('utf-8', errors='replace'))
+print('STDERR:\\n', r2.std_err.decode('utf-8', errors='replace'))
+sys.exit(r2.status_code)
+"""
+          sh 'python3 run_remote_win11_upgrade.py > win11_upgrade.out 2>&1 || true'
+          archiveArtifacts artifacts: 'win11_upgrade.out', fingerprint: true
+          echo readFile('win11_upgrade.out')
+          def out = readFile('win11_upgrade.out')
+          if (out.contains('ERROR_WRAPPER_CREATE')) { error('Failed to create remote wrapper') }
+          if (! (out =~ /EXIT\\s+0/)) {
+            error("Remote upgrade did not return success. Check logs: win11_upgrade.out and remote Panther logs.")
+          } else {
+            echo "Win11 upgrade launched successfully on remote. Check remote logs and schedule reboot."
+          }
+        }
+      }
+    }
+
+    stage('Complete / Report') {
+      steps {
+        script {
+          def next = readFile('next_step.txt').trim()
+          if (next == 'none_win10' || next == 'none_win11') {
+            echo "No upgrade required. Collected OS info stored in os_info.out"
+          } else if (next == 'unknown') {
+            echo "OS could not be determined. See os_info.out for details."
+            currentBuild.result = 'UNSTABLE'
+          } else {
+            echo "Upgrade workflow ran. Check archived logs and remote Panther logs for details and reboot status."
+          }
+        }
+      }
+    }
+
+  } // stages
+
+  post {
+    always {
+      archiveArtifacts artifacts: '*.out, *.py, *.ps1, os_info.out, winrm_check.out, win10_upgrade.out, win11_upgrade.out', fingerprint: true
+      echo "Workspace archived artifacts saved. Check job artifacts for logs."
+    }
+  }
+
+}
