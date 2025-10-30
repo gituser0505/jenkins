@@ -1,0 +1,125 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'MACHINE_IP', defaultValue: '', description: 'Target Windows machine IP or hostname')
+    string(name: 'USERNAME', defaultValue: '', description: 'Windows admin username (domain\\user or local)')
+    password(name: 'PASSWORD', defaultValue: '', description: 'Password for the user')
+  }
+
+  environment {
+    WIN10_ISO = 'C:\\isos\\Win10_22H2_x64.iso'
+    WIN11_ISO = 'C:\\isos\\Win11_24H2_x64.iso'
+    LOG_PATH  = 'C:\\JenkinsLogs'
+  }
+
+  stages {
+
+    stage('Check WinRM HTTPS Connectivity') {
+      steps {
+        powershell '''
+        Write-Host "🔍 Checking WinRM connectivity over HTTPS (5986)..."
+        $ErrorActionPreference = "Stop"
+        try {
+            $session = Test-WSMan -ComputerName $env:MACHINE_IP -UseSSL -ErrorAction Stop
+            Write-Host "✅ WinRM connection successful to $($env:MACHINE_IP)"
+        } catch {
+            Write-Error "❌ Unable to reach $($env:MACHINE_IP) over WinRM HTTPS. Error: $_"
+            exit 1
+        }
+        '''
+      }
+    }
+
+    stage('Detect Windows Version') {
+      steps {
+        powershell '''
+        Write-Host "🔎 Detecting remote Windows version..."
+        $secpass = ConvertTo-SecureString $env:PASSWORD -AsPlainText -Force
+        $cred = New-Object System.Management.Automation.PSCredential ($env:USERNAME, $secpass)
+
+        $osinfo = Invoke-Command -ComputerName $env:MACHINE_IP -UseSSL -Credential $cred -ScriptBlock {
+            $os = Get-ItemProperty "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
+            [PSCustomObject]@{
+                ProductName = $os.ProductName
+                DisplayVersion = $os.DisplayVersion
+                ReleaseId = $os.ReleaseId
+            }
+        }
+
+        $osinfo | Tee-Object -FilePath "$env:LOG_PATH\\os_info.txt"
+        Write-Host "Detected: $($osinfo.ProductName) $($osinfo.DisplayVersion)"
+
+        if ($osinfo.ProductName -match "Windows 10" -and $osinfo.DisplayVersion -ne "22H2") {
+            Set-Content "$env:LOG_PATH\\upgrade_action.txt" "WIN10"
+        } elseif ($osinfo.ProductName -match "Windows 11" -and $osinfo.DisplayVersion -ne "24H2") {
+            Set-Content "$env:LOG_PATH\\upgrade_action.txt" "WIN11"
+        } else {
+            Set-Content "$env:LOG_PATH\\upgrade_action.txt" "NONE"
+        }
+        '''
+      }
+    }
+
+    stage('Upgrade Execution') {
+      steps {
+        powershell '''
+        $action = Get-Content "$env:LOG_PATH\\upgrade_action.txt"
+        $secpass = ConvertTo-SecureString $env:PASSWORD -AsPlainText -Force
+        $cred = New-Object PSCredential ($env:USERNAME, $secpass)
+
+        if ($action -eq "NONE") {
+            Write-Host "✅ System is already up to date. No upgrade required."
+            exit 0
+        }
+
+        $iso = if ($action -eq "WIN10") { $env:WIN10_ISO } else { $env:WIN11_ISO }
+        Write-Host "🚀 Starting upgrade for $action using ISO: $iso"
+
+        Invoke-Command -ComputerName $env:MACHINE_IP -UseSSL -Credential $cred -ScriptBlock {
+            param($iso, $action)
+            $logDir = "C:\\Windows\\Temp\\JenkinsUpgradeLogs"
+            New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+            Write-Output "Mounting ISO from $iso ..."
+            Mount-DiskImage -ImagePath $iso -ErrorAction Stop
+            Start-Sleep -Seconds 3
+            $drive = (Get-DiskImage -ImagePath $iso | Get-Volume).DriveLetter + ":"
+            $setup = Join-Path $drive "setup.exe"
+            if (!(Test-Path $setup)) { Write-Output "setup.exe not found!"; exit 1 }
+
+            Write-Output "Running upgrade from $($action)..."
+            $args = "/auto upgrade /quiet /noreboot /dynamicupdate disable /copylogs `"$logDir`""
+            & $setup $args
+            $exit = $LASTEXITCODE
+            Write-Output "Setup exit code: $exit"
+            Dismount-DiskImage -ImagePath $iso -ErrorAction SilentlyContinue
+            return $exit
+        } -ArgumentList $iso, $action | Tee-Object -FilePath "$env:LOG_PATH\\upgrade_result.txt"
+
+        Write-Host "✅ Upgrade launched. Review logs in C:\\Windows\\Temp\\JenkinsUpgradeLogs on the remote machine."
+        '''
+      }
+    }
+
+    stage('Summary') {
+      steps {
+        powershell '''
+        Write-Host "📋 Upgrade Summary:"
+        Get-Content "$env:LOG_PATH\\os_info.txt"
+        Write-Host "--------------------------------------"
+        Get-Content "$env:LOG_PATH\\upgrade_result.txt" -ErrorAction SilentlyContinue
+        Write-Host "--------------------------------------"
+        Write-Host "Logs stored in $env:LOG_PATH on Jenkins master and C:\\Windows\\Temp\\JenkinsUpgradeLogs on target."
+        '''
+      }
+    }
+
+  }
+
+  post {
+    always {
+      powershell 'Compress-Archive -Path "$env:LOG_PATH\\*" -DestinationPath "$env:WORKSPACE\\UpgradeLogs.zip" -Force'
+      archiveArtifacts artifacts: 'UpgradeLogs.zip', fingerprint: true
+    }
+  }
+}
