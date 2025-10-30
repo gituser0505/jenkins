@@ -1,0 +1,12 @@
+Get-WmiObject Win32_PnPSignedDriver |
+  Where-Object { $_.DriverProviderName -ne "Microsoft" } |
+  Select-Object DeviceName, DriverProviderName, DriverVersion, InfName |
+  Sort-Object DriverProviderName |
+  Out-File "C:\non_ms_drivers.txt"
+
+
+Get-Service | Where-Object { $_.StartType -eq 'Automatic' -and $_.Name -notmatch '^(W|win|Lanman|EventLog)' } |
+  Select-Object Name, DisplayName, StartType, Status |
+  Out-File "C:\non_ms_services.txt"
+
+
