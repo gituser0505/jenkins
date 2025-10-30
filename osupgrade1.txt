@@ -1,0 +1,196 @@
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'MACHINE_IP', defaultValue: '', description: 'Target Windows machine IP or hostname')
+    string(name: 'USERNAME', defaultValue: '', description: 'Windows admin username (domain\\user or local)')
+    password(name: 'PASSWORD', defaultValue: '', description: 'Password for the user')
+  }
+
+  environment {
+    WIN10_ISO = '/var/lib/jenkins/isos/Win10_22H2_x64.iso'
+    WIN11_ISO = '/var/lib/jenkins/isos/Win11_24H2_x64.iso'
+  }
+
+  stages {
+
+    stage('Check Python Dependencies') {
+      steps {
+        echo "Ensuring pywinrm is installed on Jenkins master..."
+        sh '''
+        set -e
+        python3 -m pip show pywinrm >/dev/null 2>&1 || python3 -m pip install --user pywinrm
+        '''
+      }
+    }
+
+    stage('Check WinRM HTTPS Connectivity') {
+      steps {
+        script {
+          writeFile file: 'check_winrm.py', text: """
+import sys, traceback, winrm
+host='${params.MACHINE_IP}'
+user='${params.USERNAME}'
+pwd='${params.PASSWORD}'
+
+try:
+    sess = winrm.Session(host, auth=(user,pwd), transport='ntlm', server_cert_validation='ignore')
+    r = sess.run_ps('hostname; whoami')
+    print('---STDOUT---\\n' + r.std_out.decode())
+    print('---STDERR---\\n' + r.std_err.decode())
+    if r.status_code != 0:
+        print('Remote command failed with code', r.status_code)
+        sys.exit(2)
+    print('WinRM connection OK')
+except Exception as e:
+    print('Failed to connect via WinRM HTTPS:', e)
+    traceback.print_exc()
+    sys.exit(1)
+"""
+          sh 'python3 check_winrm.py > winrm_connection.log 2>&1 || true'
+          echo readFile('winrm_connection.log')
+          if (readFile('winrm_connection.log').contains('Failed to connect')) {
+            error("❌ WinRM connection failed — check port 5986 and certificate setup.")
+          }
+        }
+      }
+      post {
+        always { archiveArtifacts artifacts: 'winrm_connection.log', fingerprint: true }
+      }
+    }
+
+    stage('Detect Windows Version') {
+      steps {
+        script {
+          writeFile file: 'get_os_info.py', text: """
+import sys, winrm, json
+sess = winrm.Session('${params.MACHINE_IP}', auth=('${params.USERNAME}','${params.PASSWORD}'),
+                     transport='ntlm', server_cert_validation='ignore')
+ps = '''
+$os = Get-ItemProperty -Path "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
+[PSCustomObject]@{
+  ProductName = $os.ProductName
+  DisplayVersion = $os.DisplayVersion
+}
+'''
+r = sess.run_ps(ps)
+print(r.std_out.decode())
+open('os_info.json','w').write(r.std_out.decode())
+"""
+          sh 'python3 get_os_info.py > os_info.log 2>&1 || true'
+          echo readFile('os_info.log')
+          def raw = readFile('os_info.log')
+          if (!raw.contains('Windows')) error("Unable to detect OS info.")
+          if (raw.toLowerCase().contains('windows 10')) {
+            env.OS_TYPE = "Win10"
+          } else if (raw.toLowerCase().contains('windows 11')) {
+            env.OS_TYPE = "Win11"
+          } else {
+            env.OS_TYPE = "Unknown"
+          }
+          env.OS_VER = raw =~ /DisplayVersion\s*:\s*(\S+)/ ? (raw =~ /DisplayVersion\s*:\s*(\S+)/)[0][1] : "Unknown"
+          echo "Detected: ${env.OS_TYPE} ${env.OS_VER}"
+        }
+      }
+      post {
+        always { archiveArtifacts artifacts: 'os_info.log', fingerprint: true }
+      }
+    }
+
+    stage('Upgrade to Windows 10 22H2 (if required)') {
+      when { expression { env.OS_TYPE == "Win10" && env.OS_VER != "22H2" } }
+      steps {
+        script {
+          echo "Running upgrade to Windows 10 22H2..."
+          def isoB64 = sh(script: "base64 ${env.WIN10_ISO} | head -n 20", returnStdout: true).trim()
+          echo "✅ ISO located on Jenkins master (${env.WIN10_ISO}) — using local copy."
+
+          writeFile file: 'upgrade_win10.py', text: """
+import sys, winrm
+host='${params.MACHINE_IP}'
+user='${params.USERNAME}'
+pwd='${params.PASSWORD}'
+iso='${env.WIN10_ISO}'
+sess = winrm.Session(host, auth=(user,pwd), transport='ntlm', server_cert_validation='ignore')
+ps = f'''
+$isoPath = "{iso}"
+$logPath = "C:\\\\Windows\\\\Temp\\\\JenkinsLogs"
+New-Item -Path $logPath -ItemType Directory -Force | Out-Null
+Write-Output "Mounting ISO..."
+Mount-DiskImage -ImagePath $isoPath
+$drive = (Get-DiskImage -ImagePath $isoPath | Get-Volume).DriveLetter + ':'
+$setup = Join-Path $drive 'setup.exe'
+Write-Output "Running setup..."
+& $setup /auto upgrade /quiet /noreboot /dynamicupdate disable /copylogs "$logPath"
+Write-Output "ExitCode=$LASTEXITCODE"
+'''
+r = sess.run_ps(ps)
+open('upgrade_win10.log','wb').write(r.std_out)
+open('upgrade_win10_err.log','wb').write(r.std_err)
+print(r.std_out.decode())
+sys.exit(r.status_code)
+"""
+          sh 'python3 upgrade_win10.py || true'
+          echo readFile('upgrade_win10.log')
+          archiveArtifacts artifacts: 'upgrade_win10*.log', fingerprint: true
+        }
+      }
+    }
+
+    stage('Upgrade to Windows 11 24H2 (if required)') {
+      when { expression { env.OS_TYPE == "Win11" && env.OS_VER != "24H2" } }
+      steps {
+        script {
+          echo "Running upgrade to Windows 11 24H2..."
+          writeFile file: 'upgrade_win11.py', text: """
+import sys, winrm
+host='${params.MACHINE_IP}'
+user='${params.USERNAME}'
+pwd='${params.PASSWORD}'
+iso='${env.WIN11_ISO}'
+sess = winrm.Session(host, auth=(user,pwd), transport='ntlm', server_cert_validation='ignore')
+ps = f'''
+$isoPath = "{iso}"
+$logPath = "C:\\\\Windows\\\\Temp\\\\JenkinsLogs"
+New-Item -Path $logPath -ItemType Directory -Force | Out-Null
+Write-Output "Mounting ISO..."
+Mount-DiskImage -ImagePath $isoPath
+$drive = (Get-DiskImage -ImagePath $isoPath | Get-Volume).DriveLetter + ':'
+$setup = Join-Path $drive 'setup.exe'
+Write-Output "Running setup..."
+& $setup /auto upgrade /quiet /noreboot /dynamicupdate disable /copylogs "$logPath"
+Write-Output "ExitCode=$LASTEXITCODE"
+'''
+r = sess.run_ps(ps)
+open('upgrade_win11.log','wb').write(r.std_out)
+open('upgrade_win11_err.log','wb').write(r.std_err)
+print(r.std_out.decode())
+sys.exit(r.status_code)
+"""
+          sh 'python3 upgrade_win11.py || true'
+          echo readFile('upgrade_win11.log')
+          archiveArtifacts artifacts: 'upgrade_win11*.log', fingerprint: true
+        }
+      }
+    }
+
+    stage('Summary') {
+      steps {
+        echo """
+✅ Jenkins Pipeline Complete
+- Machine: ${params.MACHINE_IP}
+- Detected: ${env.OS_TYPE} ${env.OS_VER}
+- Logs archived under this job.
+- Check remote: C:\\Windows\\Temp\\JenkinsLogs for setupact.log / setuperr.log
+"""
+      }
+    }
+
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: '*.log, *.py', fingerprint: true
+    }
+  }
+}
