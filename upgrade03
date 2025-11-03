@@ -1,0 +1,90 @@
+Start-Sleep -Seconds 3
+
+# Find mounted ISO drive
+$drive = (Get-Volume -DiskImage (Get-DiskImage -ImagePath $dst)).DriveLetter + ":"
+$setup = Join-Path $drive "setup.exe"
+
+if (!(Test-Path $setup)) {
+    Write-Output "❌ setup.exe not found in $drive!"
+    exit 1
+}
+
+Write-Output "Running upgrade from $($action)..."
+Write-Output "Using setup.exe: $setup"
+
+# Define logs
+$logDir = "C:\Windows\Temp\JenkinsUpgradeLogs"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+# Define argument list correctly
+$args = '/Auto','Upgrade','/Quiet','/NoReboot','/DynamicUpdate','Disable','/CopyLogs',$logDir,'/ShowOOBE','None'
+
+# Run setup and wait for completion
+$process = Start-Process -FilePath $setup -ArgumentList $args -Wait -PassThru
+$exit = $process.ExitCode
+Write-Output "Setup.exe exited with code: $exit"
+
+# If exit = 0, setup started successfully (not completed)
+if ($exit -eq 0) {
+    Write-Output "Setup launched successfully, monitoring logs for progress..."
+} else {
+    Write-Output "❌ Setup failed to launch. Exit code: $exit"
+    exit $exit
+}
+
+# -------------------------
+# MONITOR PHASE
+# -------------------------
+$pantherPath = "C:\$WINDOWS.~BT\Sources\Panther"
+$setupAct = Join-Path $pantherPath "setupact.log"
+$setupErr = Join-Path $pantherPath "setuperr.log"
+
+Write-Output "Waiting for Panther logs to appear..."
+$timeout = (Get-Date).AddHours(2)
+
+while ((Get-Date) -lt $timeout) {
+    if (Test-Path $setupAct) {
+        $tail = Get-Content $setupAct -Tail 10
+        Write-Output "`n--- setupact.log (last 10 lines) ---`n$tail"
+    }
+    if (Test-Path $setupErr) {
+        $err = Get-Content $setupErr -Tail 5
+        if ($err) { Write-Output "`n--- setuperr.log ---`n$err" }
+    }
+
+    # Detect "CompatibilityReport" that shows clean install requirement
+    if (Select-String -Path $setupAct -Pattern "Remove everything" -Quiet) {
+        Write-Output "⚠️ Detected clean install requirement — cancelling upgrade!"
+        Stop-Process -Name setuphost -ErrorAction SilentlyContinue
+        Stop-Process -Name setup -ErrorAction SilentlyContinue
+        exit 99
+    }
+
+    # Detect upgrade complete
+    if (Select-String -Path $setupAct -Pattern "Finalizing Windows upgrade" -Quiet) {
+        Write-Output "✅ Upgrade process appears to be completing..."
+        break
+    }
+
+    Start-Sleep -Seconds 30
+}
+
+if ((Get-Date) -ge $timeout) {
+    Write-Output "⏰ Timeout reached. Upgrade logs not showing completion."
+    exit 408
+}
+
+# Dismount ISO after monitoring
+Dismount-DiskImage -ImagePath $dst -ErrorAction SilentlyContinue
+
+Write-Output "`n--- Upgrade Summary ---"
+if (Select-String -Path $setupAct -Pattern "Successfully installed") {
+    Write-Output "✅ Upgrade completed successfully!"
+    exit 0
+} elseif (Select-String -Path $setupErr -Pattern "Error") {
+    Write-Output "❌ Upgrade failed. Check setuperr.log for details."
+    exit 1
+} else {
+    Write-Output "⚠️ Upgrade status unclear. Review logs manually."
+    exit 2
+}
