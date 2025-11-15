@@ -1,0 +1,70 @@
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$Month  # e.g. '2025-10'
+)
+
+Add-Type -AssemblyName "Microsoft.UpdateServices.Administration"
+$wsus = [Microsoft.UpdateServices.Administration.AdminProxy]::GetUpdateServer("WSUS_SERVER_NAME",$False)
+
+# Parse month dates
+$StartDate = Get-Date "$Month-01"
+$EndDate   = $StartDate.AddMonths(1).AddDays(-1)
+
+# Find all updates released this month
+$updatesThisMonth = $wsus.GetUpdates() | Where-Object {
+    $_.ArrivalDate -ge $StartDate -and $_.ArrivalDate -le $EndDate
+}
+
+# Filter only approved updates
+$approvedUpdates = $updatesThisMonth | Where-Object {
+    $_.IsApproved -eq $true
+}
+
+# Split by OS
+$osGroups = $approvedUpdates | Group-Object { $_.ProductTitles -join ',' }
+
+# Summary per OS
+$osSummary = $osGroups | ForEach-Object {
+    [PSCustomObject]@{
+        OS = $_.Name
+        PatchCount = ($_.Group).Count
+    }
+}
+$osSummary | Format-Table -AutoSize
+
+# Per-machine patch status
+$computers = $wsus.GetComputerTargets()
+$results = foreach ($comp in $computers) {
+    $os = $comp.OperatingSystem
+    $thisMonthApproved = $approvedUpdates | Where-Object { $_.ProductTitles -contains $os }
+    $status = $thisMonthApproved | ForEach-Object {
+        $info = $_.GetUpdateInstallationInfoPerComputerTarget($comp)
+        [PSCustomObject]@{
+            PatchTitle = $_.Title
+            Status = $info.UpdateInstallationState
+            InstallState = $info.UpdateInstallationState
+            Downloaded = ($info.UpdateInstallationState -eq 'Downloaded')
+            Installed = ($info.UpdateInstallationState -eq 'Installed')
+            Waiting = ($info.UpdateInstallationState -eq 'NotInstalled')
+            PendingReboot = ($info.UpdateInstallationState -eq 'InstalledPendingReboot')
+        }
+    }
+    $applicable = $status.Count
+    $installed = ($status | Where-Object { $_.Installed }).Count
+    $downloaded = ($status | Where-Object { $_.Downloaded }).Count
+    $waiting = ($status | Where-Object { $_.Waiting }).Count
+    $pendingReboot = ($status | Where-Object { $_.PendingReboot }).Count
+    [PSCustomObject]@{
+        Computer = $comp.FullDomainName
+        OS = $os
+        ApprovedNum = $thisMonthApproved.Count
+        Applicable = $applicable
+        Installed = $installed
+        Downloaded = $downloaded
+        Waiting = $waiting
+        PendingReboot = $pendingReboot
+    }
+}
+$results | Export-Csv -Path "WSUS_Monthly_Report_$Month.csv" -NoTypeInformation
+
+Write-Host "Report generated for $Month at WSUS_Monthly_Report_$Month.csv"
