@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-WWindows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS">
+
+      <OOBE>
+        <!-- ⭐ Skip ONLY network requirement (No Internet Needed) -->
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+
+        <!-- ⭐ Allow offline setup / skip Microsoft Account requirement -->
+        <DisableOnlineAccountProvisioning>true</DisableOnlineAccountProvisioning>
+
+        <!-- ⭐ Show normal interactive OOBE screens -->
+        <HideEULAPage>false</HideEULAPage>
+        <ProtectYourPC>3</ProtectYourPC>
+        <NetworkLocation>Work</NetworkLocation>
+
+        <!-- ⭐ DO NOT skip Machine OOBE / User OOBE -->
+        <SkipMachineOOBE>false</SkipMachineOOBE>
+        <SkipUserOOBE>false</SkipUserOOBE>
+      </OOBE>
+
+    </component>
+  </settings>
+
+</unattend>
