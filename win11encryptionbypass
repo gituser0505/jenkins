@@ -1,0 +1,16 @@
+reg add "HKLM\SOFTWARE\Policies\Microsoft\FVE" /v DisableFVE /t REG_DWORD /d 1 /f
+reg add "HKLM\SOFTWARE\Policies\Microsoft\FVE" /v EnableBDEWithNoTPM /t REG_DWORD /d 0 /f
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\BitLocker" /v PreventDeviceEncryption /t REG_DWORD /d 1 /f
+reg add "HKLM\SYSTEM\CurrentControlSet\Control\BitLockerStatus" /v DeviceEncryptionStatus /t REG_DWORD /d 0 /f
+
+
+sc config BDESVC start= disabled
+sc stop BDESVC
+
+
+manage-bde -protectors -delete C: -type TPM
+manage-bde -protectors -delete C: -type NumericalPassword
+manage-bde -off C:
+
+manage-bde -status
+
