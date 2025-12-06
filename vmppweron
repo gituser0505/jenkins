@@ -1,0 +1,39 @@
+# Import PowerCLI module
+Import-Module VMware.PowerCLI
+
+# Disable certificate warnings (optional)
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false
+
+# vCenter details
+$vcenter = "your-vcenter.domain.com"
+$username = "administrator@vsphere.local"
+$password = "YourPassword"
+
+# Path to VM list file
+$vmListFile = "C:\VMList.txt"
+
+# Connect to vCenter
+Connect-VIServer -Server $vcenter -User $username -Password $password
+
+# Read VM names
+$vmNames = Get-Content $vmListFile
+
+foreach ($vm in $vmNames) {
+    Write-Host "Processing VM: $vm"
+
+    $vmObject = Get-VM -Name $vm -ErrorAction SilentlyContinue
+
+    if ($vmObject) {
+        if ($vmObject.PowerState -ne "PoweredOn") {
+            Write-Host "Powering ON $vm ..." -ForegroundColor Green
+            Start-VM -VM $vmObject -Confirm:$false
+        } else {
+            Write-Host "$vm is already Powered ON." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "VM not found in vCenter: $vm" -ForegroundColor Red
+    }
+}
+
+# Disconnect session
+Disconnect-VIServer -Server $vcenter -Confirm:$false
